@@ -9,14 +9,15 @@
 你要实现的程序名为 Gitlet。它为文件集合保存历史版本，可以恢复文件、维护不同开发分支，
 并把两个分支的变化合到一起。一个提交引用根 tree，根 tree 及其子 tree 表示完整的文件快照。
 
-本项目包含 13 个本地命令：`init`、`add`、`commit`、`rm`、`log`、`global-log`、
+本项目包含 12 个本地命令：`init`、`add`、`commit`、`log`、`global-log`、
 `find`、`status`、`checkout`、`branch`、`rm-branch`、`reset`、`merge`。
-`checkout` 有三种参数形式。`status` 完整显示五个栏目。
+`checkout` 有三种参数形式。`status` 显示分支、已暂存变化、未暂存变化和未跟踪文件四个栏目。
 `add-remote`、`rm-remote`、`push`、`fetch`、`pull` 是后续扩展，本实现没有包含它们。
 
 使用 Python 3.10+ 和标准库即可。仓库支持子目录中的普通文件。
 文件参数使用相对仓库根目录的路径，例如 `note.txt` 或 `src/note.txt`，不能使用绝对路径或 `../note.txt`。
-`add` 与 `rm` 一次处理一个文件，不接受目录参数。当前仓库格式为 v2；旧格式需另行迁移。
+`add` 接受单个文件、目录或 `.`，统一暂存新增、修改和删除；不再提供 `gitlet rm`。
+当前仓库格式为 v3，暂存区为 Stage，保存在 `stage.json`；旧格式需另行迁移。
 不追踪符号链接、权限和空目录，不提供真实 Git 的网络协议或 detached HEAD 模式。
 
 ## 2. 启动与运行约定
@@ -113,7 +114,11 @@ gitlet add note.txt
 
 把文件当前字节内容保存成 blob，并更新暂存区。已经暂存过同名文件时，以这次的版本替换。
 若内容与当前提交相同，取消这个文件的新增暂存；无论内容是否变化，都取消其待删除标记。
-文件缺失时输出 `File does not exist.`。
+已跟踪文件缺失时暂存删除；仅曾暂存新增的文件缺失时取消新增暂存。
+文件缺失且 HEAD、Stage 都没有对应记录时输出 `File does not exist.`。
+`gitlet add src` 暂存 src 下的新增、修改和删除，整个目录已被删除时也可使用。
+`gitlet add .` 暂存整个仓库的变化，排除根目录 `.gitlet` 元数据。
+批量暂存先验证全部计划，不修改工作文件。
 
 ### 4.3 `commit`：保存暂存快照
 
@@ -129,19 +134,7 @@ gitlet commit "完成解析器"
 没有任何新增或删除暂存时输出 `No changes added to the commit.`。
 没有传递消息参数属于参数错误，输出 `Incorrect operands.`。
 
-### 4.4 `rm`：取消暂存或停止跟踪
-
-```sh
-gitlet rm note.txt
-```
-
-如果文件只是新增暂存、尚未被当前提交跟踪，取消暂存并保留工作文件。
-如果当前提交已经跟踪该文件，则取消其新增暂存、标记待删除，并删除工作目录中的普通文件。
-文件已经不在工作目录时仍可暂存删除。要让下一次快照停止跟踪它，随后执行 `commit`。
-
-文件既未新增暂存、也未被当前提交跟踪时，输出 `No reason to remove the file.`。
-
-### 4.5 `log`：查看当前分支历史
+### 4.4 `log`：查看当前分支历史
 
 ```sh
 gitlet log
@@ -161,16 +154,16 @@ Date: Fri Oct 2 10:15:30 2026 +0000
 合并提交在 `commit` 行与 `Date` 行之间额外输出 `Merge: <第一父ID前7位> <第二父ID前7位>`。
 日期用本地时区显示，星期和月份固定为英文；每个条目后有一个空行。
 
-### 4.6 `global-log`：查看所有提交
+### 4.5 `global-log`：查看所有提交
 
 ```sh
 gitlet global-log
 ```
 
 输出仓库保存的每一个提交，包括已被 `reset` 跳过、或者不再有分支指向的提交。
-条目格式与 `log` 相同。输出顺序不限，程序直接遍历提交目录，不保证时间或 ID 排序。
+条目格式与 `log` 相同。输出顺序不限，程序遍历统一对象库并筛选 commit，不保证时间或 ID 排序。
 
-### 4.7 `find`：按提交消息查找
+### 4.6 `find`：按提交消息查找
 
 ```sh
 gitlet find "完成解析器"
@@ -179,7 +172,7 @@ gitlet find "完成解析器"
 对完整消息进行精确比较，输出所有匹配的提交 ID，每行一个。
 没有匹配时输出 `Found no commit with that message.`。该操作不是模糊搜索。
 
-### 4.8 `status`：查看仓库与文件状态
+### 4.7 `status`：查看仓库与文件状态
 
 ```sh
 gitlet status
@@ -192,11 +185,9 @@ gitlet status
 *master
 topic
 
-=== Staged Files ===
-new.txt
-
-=== Removed Files ===
-old.txt
+=== Changes Staged For Commit ===
+new.txt (new)
+old.txt (deleted)
 
 === Modifications Not Staged For Commit ===
 note.txt (modified)
@@ -212,10 +203,10 @@ scratch.txt
 同一缺失文件只输出一条 `(deleted)`。
 
 “未跟踪文件”包括：既未被当前提交跟踪、也未新增暂存的普通文件；
-还包括已通过 `rm` 暂存删除、后来又手动创建的同名文件。子目录不会被列入栏目。
+还包括删除后通过 `add` 暂存、后来又手动创建的同名文件。子目录中的文件以相对路径列出。
 本程序实现了这两个扩展栏目，而非只输出标题。
 
-### 4.9 `checkout`：恢复文件或切换分支
+### 4.8 `checkout`：恢复文件或切换分支
 
 三种调用形式：
 
@@ -247,7 +238,7 @@ gitlet checkout topic
 前缀匹配零个或多个提交时，本实现均输出 `No commit with that id exists.`；
 原说明未规定歧义前缀的具体报错，这里选择拒绝歧义。
 
-### 4.10 `branch`：创建分支指针
+### 4.9 `branch`：创建分支指针
 
 ```sh
 gitlet branch topic
@@ -270,7 +261,7 @@ gitlet checkout master
 切回 `master` 后会恢复其提交里的版本。
 本实现允许 `feature/parser` 这样的分支名，它只是一个名称，不表示跟踪子目录。
 
-### 4.11 `rm-branch`：删除分支指针
+### 4.10 `rm-branch`：删除分支指针
 
 ```sh
 gitlet rm-branch topic
@@ -280,7 +271,7 @@ gitlet rm-branch topic
 目标不存在时输出 `A branch with that name does not exist.`；
 目标为当前分支时输出 `Cannot remove the current branch.`。
 
-### 4.12 `reset`：恢复指定快照并移动当前分支
+### 4.11 `reset`：恢复指定快照并移动当前分支
 
 ```sh
 gitlet reset 提交ID
@@ -293,7 +284,7 @@ gitlet reset 提交ID
 存在未跟踪文件覆盖风险时，使用 `checkout` 的未跟踪文件错误。
 这种情况下没有任何文件或指针变更。重置不会删除被跳过的历史提交。
 
-### 4.13 `merge`：合并另一分支
+### 4.12 `merge`：合并另一分支
 
 ```sh
 gitlet merge topic
@@ -436,14 +427,14 @@ HEAD 与暂存区可直接阅读：
 
 ```sh
 cat .gitlet/HEAD
-python3 -m json.tool .gitlet/index.json
+python3 -m json.tool .gitlet/stage.json
 ```
 
 对象保存在 `.gitlet/objects/<ID 前两位>/<ID 剩余部分>`，使用 zlib 压缩。
 可通过 `Repository.objects.read(完整对象ID)` 查看解析后的对象。
 
 日志顺序不对时检查父提交链接；文件恢复不对时检查 blob ID 和原始字节；
-`status` 不对时先检查前面的 `add` 或 `rm` 是否正确保存了暂存区。
+`status` 不对时先检查前面的 `add` 是否正确保存了暂存区。
 
 ## 8. 后续远程扩展
 

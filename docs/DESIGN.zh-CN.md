@@ -1,4 +1,4 @@
-# Python Gitlet v2 设计说明
+# Python Gitlet v3 设计说明
 
 ## 模块与职责
 
@@ -7,7 +7,7 @@
 - `objects.py`：统一对象库，计算 ID、压缩存储、类型和完整性校验。
 - `trees.py`：按路径查找文件、展开快照、向目录 tree 应用暂存变化。
 - `refs.py`：符号 HEAD 和分支引用。
-- `index.py`：暂存区模型及 JSON 读写。
+- `stage.py`：暂存区模型及 JSON 读写。
 - `validation.py` / `errors.py`：共享的名称校验与 GitletError。
 - `repository.py`：组织本地命令、提交图遍历与工作目录修改。
 
@@ -19,9 +19,9 @@
 工作目录/
 ├── 用户文件与子目录...
 └── .gitlet/
-    ├── format.json              {"version":2}
+    ├── format.json              {"version":3}
     ├── HEAD                     ref: refs/heads/master
-    ├── index.json               暂存变化
+    ├── stage.json               暂存变化
     ├── refs/heads/
     │   ├── master               commit ID
     │   └── feature/login        commit ID
@@ -34,7 +34,7 @@ tree 的条目引用 blob 或子 tree。所有对象共用一个对象库，可�
 分支名允许目录层级，但必须通过名称检查；不能同时存在分支 `feature` 与 `feature/login`。
 删除分支只删除引用，保留对象。暂不支持 detached HEAD。
 
-版本 2 的对象结构与 ID 算法不同于旧版本。非 v2 仓库在命令入口被明确拒绝，
+版本 3 将暂存文件改为 `stage.json`，对象格式沿用 v2。非 v3 仓库在命令入口被明确拒绝，
 没有自动迁移。JSON payload 属于本项目自定义格式，不能与真实 Git 互通。
 
 ## 对象格式
@@ -73,19 +73,29 @@ Commit 不再保存完整的文件映射。日志沿第一父链显示；祖先�
 
 ## 暂存与提交
 
-`index.json` 保存相对 HEAD 的变化：
+`stage.json` 保存相对 HEAD 的变化：
 
 ```json
 {"add":{"src/main.py":"<blob ID>"},"remove":["src/old.py"]}
 ```
 
-内存模型 Index 使用 dict 和 set。新增与删除路径不能重叠，删除数组落盘时排序。
+内存模型 Stage 使用 dict 和 set。新增与删除路径不能重叠，删除数组落盘时排序。
 路径相对仓库根目录，使用 `/`，禁止绝对路径、空路径段、`.`、`..`、反斜杠、NUL
 及根目录的 `.gitlet`。工作文件操作额外检查每一层路径，拒绝符号链接遍历。
 
-`add` 保存当时的 blob，取消同路径删除；与 HEAD 一致时取消新增暂存。
-`rm` 取消新增暂存；对于 HEAD 已跟踪的文件，还删除工作文件并暂存删除。
-手动删除不会自动暂存。每次 add/rm 处理一个文件，不递归处理目录参数。
+`add` 将指定路径范围的 Workspace 状态同步到 Stage：文件存在时保存当时的 blob，
+取消同路径删除；与 HEAD 一致时取消新增暂存。文件缺失且 HEAD 跟踪时暂存删除，
+缺失且仅曾暂存新增时取消新增暂存。HEAD 和 Stage 都没有记录的缺失路径报错。
+不再提供 rm 命令；先用系统命令删除文件，再执行 add。
+
+add 支持文件、目录和 `.`。目录候选来自 HEAD、Stage 和 Workspace 的路径并集，
+包含已从磁盘移除的目录中的旧文件。批量操作先生成全部暂存计划并验证最终快照，
+再保存 blob 和 Stage；不改变 Workspace。无文件的空目录不产生变化。
+符号链接不跟踪，已知路径被符号链接替换时拒绝暂存，不能误判为删除。
+
+status 比较 HEAD 与待提交快照，显示已暂存 new、modified、deleted；
+再比较待提交快照与 Workspace，显示未暂存 modified、deleted 和 untracked。
+文件已暂存删除但重新创建时显示为 untracked，再次 add 将更新或取消删除。
 
 提交先验证最终快照不存在文件/目录冲突，例如不能同时包含 `src` 和 `src/main.py`。
 随后按变更路径构造更新计划，对每个受影响目录集中更新，重写该目录及其祖先 tree，

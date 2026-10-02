@@ -6,7 +6,7 @@ from .repository import GitletError, Repository
 
 
 COMMANDS = {
-    "init": 0, "add": 1, "commit": 1, "rm": 1, "log": 0,
+    "init": 0, "add": 1, "commit": 1, "log": 0,
     "global-log": 0, "find": 1, "status": 0, "checkout": None,
     "branch": 1, "rm-branch": 1, "reset": 1, "merge": 1,
 }

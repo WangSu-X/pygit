@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 from .errors import GitletError
-from .index import Index, IndexStore
+from .stage import Stage, StageStore
 from .models import Blob, Commit, Tree, json_bytes, object_id
 from .objects import ObjectStore
 from .refs import RefStore
@@ -33,7 +33,7 @@ class Repository:
         self.directory = self.cwd / ".gitlet"
         self.objects = ObjectStore(self.directory / "objects")
         self.refs = RefStore(self.directory)
-        self.index = IndexStore(self.directory / "index.json")
+        self.stage = StageStore(self.directory / "stage.json")
 
     def require_initialized(self) -> None:
         if not self.directory.is_dir():
@@ -41,9 +41,9 @@ class Repository:
         try:
             version = json.loads((self.directory / "format.json").read_bytes())
         except (OSError, ValueError):
-            raise GitletError("Unsupported repository format; expected version 2.") from None
-        if version != {"version": 2}:
-            raise GitletError("Unsupported repository format; expected version 2.")
+            raise GitletError("Unsupported repository format; expected version 3.") from None
+        if version != {"version": 3}:
+            raise GitletError("Unsupported repository format; expected version 3.")
 
     def init(self) -> None:
         if self.directory.exists():
@@ -52,13 +52,13 @@ class Repository:
         self.directory.mkdir()
         self.objects.directory.mkdir()
         self.refs.heads.mkdir(parents=True)
-        (self.directory / "format.json").write_bytes(json_bytes({"version": 2}))
+        (self.directory / "format.json").write_bytes(json_bytes({"version": 3}))
         root = self.objects.write(Tree(()))
         initial = Commit("initial commit", 0, (), root)
         self.save_commit(initial)
         self.write_branch("master", initial.id)
         self.refs.set_head("master")
-        self.index.clear()
+        self.stage.clear()
 
     @property
     def branch_name(self) -> str:
@@ -92,12 +92,12 @@ class Repository:
     def resolve_id(self, prefix: str) -> str:
         return self.objects.resolve_commit_id(prefix)
 
-    def read_index(self) -> tuple[dict[str, str], set[str]]:
-        index = self.index.read()
-        return index.additions, index.removals
+    def read_stage(self) -> tuple[dict[str, str], set[str]]:
+        stage = self.stage.read()
+        return stage.additions, stage.removals
 
-    def write_index(self, additions: dict[str, str], removals: set[str]) -> None:
-        self.index.write(Index(additions, removals))
+    def write_stage(self, additions: dict[str, str], removals: set[str]) -> None:
+        self.stage.write(Stage(additions, removals))
 
     def save_blob(self, content: bytes) -> str:
         return self.objects.write(Blob(content))
@@ -120,25 +120,76 @@ class Repository:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
 
+    def working_files(self, scope: str = ".") -> dict[str, Path]:
+        """Scan regular files without following symlinks or repository metadata."""
+        root = self.cwd if scope == "." else self.working_path(scope)
+        if root.is_file():
+            return {scope: root}
+        working = {}
+        if not root.is_dir():
+            return working
+        for directory, dirs, names in os.walk(root, followlinks=False):
+            base = Path(directory)
+            dirs[:] = [d for d in dirs if not (base / d).is_symlink()
+                       and not (base == self.cwd and d == ".gitlet")]
+            for name in names:
+                path = base / name
+                if path.is_file() and not path.is_symlink():
+                    working[path.relative_to(self.cwd).as_posix()] = path
+        return working
+
     def add(self, name: str) -> None:
-        name = file_name(name)
-        path = self.working_path(name)
-        if not path.is_file() or path.is_symlink():
+        """Stage workspace state for a file, directory, or the entire repository."""
+        if name != ".":
+            name = validate_repo_path(name)
+        path = self.cwd if name == "." else self.working_path(name)
+        if path.exists() and not (path.is_file() or path.is_dir()):
+            raise GitletError("Unsupported file type.")
+        head = self.snapshot()
+        stage = self.stage.read()
+        known = head.keys() | stage.additions.keys() | stage.removals
+
+        def in_scope(candidate):
+            return name == "." or candidate == name or candidate.startswith(name + "/")
+
+        working = self.working_files(name)
+        candidates = {candidate for candidate in known if in_scope(candidate)} | working.keys()
+        if not candidates and not path.is_dir():
             raise GitletError("File does not exist.")
-        content = path.read_bytes()
-        blob_id = object_id(Blob(content))
-        additions, removals = self.read_index()
-        removals.discard(name)
-        if lookup_blob(self.objects, self.read_commit(self.head_id).tree, name) == blob_id:
-            additions.pop(name, None)
-        else:
-            additions[name] = self.save_blob(content)
-        self.write_index(additions, removals)
+
+        # Plan and validate all changes before writing blobs or Stage.
+        contents = {}
+        for candidate in sorted(candidates):
+            target = self.working_path(candidate)
+            if target.is_file():
+                content = target.read_bytes()
+                obj_id = object_id(Blob(content))
+                stage.removals.discard(candidate)
+                if obj_id == head.get(candidate):
+                    stage.unstage_addition(candidate)
+                else:
+                    stage.stage_blob(candidate, obj_id)
+                    contents[candidate] = content
+            elif not target.exists() or target.is_dir():
+                # A former file may now be a directory; its file entry is gone.
+                stage.unstage_addition(candidate)
+                if candidate in head:
+                    stage.stage_removal(candidate)
+                else:
+                    stage.removals.discard(candidate)
+            else:
+                raise GitletError("Unsupported file type.")
+        planned = {p: obj_id for p, obj_id in head.items() if p not in stage.removals}
+        planned.update(stage.additions)
+        validate_snapshot(planned)
+        for candidate, content in contents.items():
+            self.save_blob(content)
+        self.stage.write(stage)
 
     def commit(self, message: str, second_parent: str | None = None) -> None:
         if not message.strip():
             raise GitletError("Please enter a commit message.")
-        additions, removals = self.read_index()
+        additions, removals = self.read_stage()
         if not additions and not removals:
             raise GitletError("No changes added to the commit.")
         parent_id = self.head_id
@@ -150,19 +201,7 @@ class Repository:
         commit = Commit(message, time.time_ns(), parents, root)
         self.save_commit(commit)
         self.write_branch(self.branch_name, commit.id)
-        self.write_index({}, set())
-
-    def rm(self, name: str) -> None:
-        name = file_name(name)
-        additions, removals = self.read_index()
-        tracked = lookup_blob(self.objects, self.read_commit(self.head_id).tree, name) is not None
-        if name not in additions and not tracked:
-            raise GitletError("No reason to remove the file.")
-        additions.pop(name, None)
-        if tracked:
-            removals.add(name)
-            self.delete_working_file(name)
-        self.write_index(additions, removals)
+        self.write_stage({}, set())
 
     def delete_working_file(self, name: str) -> None:
         path = self.working_path(name)
@@ -194,17 +233,9 @@ class Repository:
         print("\n".join(matches))
 
     def status(self) -> None:
-        additions, removals = self.read_index()
+        additions, removals = self.read_stage()
         files = self.snapshot()
-        working = {}
-        for directory, dirs, names in os.walk(self.cwd, followlinks=False):
-            base = Path(directory)
-            dirs[:] = [d for d in dirs if not (base / d).is_symlink()
-                       and not (base == self.cwd and d == ".gitlet")]
-            for name in names:
-                path = base / name
-                if path.is_file() and not path.is_symlink():
-                    working[path.relative_to(self.cwd).as_posix()] = path
+        working = self.working_files()
         modifications = {}
         for name in files.keys() | additions.keys():
             if name in removals:
@@ -219,8 +250,10 @@ class Repository:
         branches = sorted(self.refs.list_branches(), key=name_order)
         sections = [
             ("Branches", [("*" if b == self.branch_name else "") + b for b in branches]),
-            ("Staged Files", sorted(additions, key=name_order)),
-            ("Removed Files", sorted(removals, key=name_order)),
+            ("Changes Staged For Commit",
+             [f"{n} ({'modified' if n in files else 'new'})"
+              for n in sorted(additions, key=name_order)]
+             + [f"{n} (deleted)" for n in sorted(removals, key=name_order)]),
             ("Modifications Not Staged For Commit",
              [f"{n} ({modifications[n]})" for n in sorted(modifications, key=name_order)]),
             ("Untracked Files", sorted(untracked, key=name_order)),
@@ -280,7 +313,7 @@ class Repository:
             self.delete_working_file(name)
         for name, content in contents.items():
             self.write_working_file(name, content)
-        self.index.clear()
+        self.stage.clear()
 
     def checkout_branch(self, name: str) -> None:
         if not self.branch_path(name).is_file():
@@ -345,7 +378,7 @@ class Repository:
         return min(latest, key=lambda c: (first_ancestors[c], second_ancestors[c], c))
 
     def merge(self, name: str) -> None:
-        additions, removals = self.read_index()
+        additions, removals = self.read_stage()
         if additions or removals:
             raise GitletError("You have uncommitted changes.")
         if not self.branch_path(name).is_file():
@@ -394,7 +427,7 @@ class Repository:
         for filename, content in writes.items():
             self.write_working_file(filename, content)
             additions[filename] = self.save_blob(content)
-        self.write_index(additions, deletes)
+        self.write_stage(additions, deletes)
         self.commit(f"Merged {name} into {self.branch_name}.", given_id)
         if conflict:
             print("Encountered a merge conflict.")

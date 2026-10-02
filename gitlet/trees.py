@@ -51,7 +51,7 @@ def validate_snapshot(files: dict[str, str]) -> None:
 def apply_changes(store: ObjectStore, root: str, additions: dict[str, str],
                   removals: set[str]) -> str:
     if additions.keys() & removals:
-        raise GitletError("Invalid staging index.")
+        raise GitletError("Invalid stage.")
     # Validate before creating any objects; support file <-> directory changes.
     files = flatten_tree(store, root)
     existing = set(files)

@@ -36,7 +36,7 @@ class V2Tests(unittest.TestCase):
 
     def test_object_layout_header_hash_and_type_validation(self):
         self.assertEqual(json.loads((self.repo.directory / "format.json").read_bytes()),
-                         {"version": 2})
+                         {"version": 3})
         self.assertEqual((self.repo.directory / "HEAD").read_text(),
                          "ref: refs/heads/master\n")
         self.assertEqual((self.repo.directory / "refs/heads/master").read_text().strip(),
@@ -85,7 +85,8 @@ class V2Tests(unittest.TestCase):
         before = self.snapshot_disk()
         self.assertEqual(apply_changes(self.repo.objects, new.tree, {}, set()), new.tree)
         self.assertEqual(before, self.snapshot_disk())
-        self.repo.rm("src/main.py")
+        (self.cwd / "src/main.py").unlink()
+        self.repo.add("src/main.py")
         self.repo.commit("remove source")
         root = self.repo.objects.read_tree(self.repo.read_commit(self.repo.head_id).tree)
         self.assertEqual([e.name for e in root.entries], ["docs"])
@@ -115,13 +116,17 @@ class V2Tests(unittest.TestCase):
 
     def test_file_directory_replacements_round_trip(self):
         file_commit = self.save("item", b"file")
-        self.repo.rm("item")
+        (self.cwd / "item").unlink()
+        self.repo.add("item")
         directory_commit = self.save("item/sub/file", b"nested")
         self.repo.reset(file_commit)
         self.assertEqual((self.cwd / "item").read_bytes(), b"file")
         self.repo.reset(directory_commit)
         self.assertEqual((self.cwd / "item/sub/file").read_bytes(), b"nested")
-        self.repo.rm("item/sub/file")
+        (self.cwd / "item/sub/file").unlink()
+        self.repo.add("item/sub/file")
+        (self.cwd / "item/sub").rmdir()
+        (self.cwd / "item").rmdir()
         new_file = self.save("item", b"replacement")
         self.assertEqual(set(self.repo.snapshot()), {"item"})
         self.repo.reset(directory_commit)
@@ -130,7 +135,8 @@ class V2Tests(unittest.TestCase):
 
     def test_directory_replacement_preserves_untracked_files(self):
         file_commit = self.save("item", b"file")
-        self.repo.rm("item")
+        (self.cwd / "item").unlink()
+        self.repo.add("item")
         self.save("item/tracked", b"tracked")
         (self.cwd / "item/precious").write_bytes(b"keep")
         before = self.snapshot_disk()
@@ -141,7 +147,7 @@ class V2Tests(unittest.TestCase):
     def test_invalid_final_snapshot_leaves_commit_state_unchanged(self):
         self.save("item/file", b"nested")
         obj_id = self.repo.save_blob(b"file")
-        self.repo.write_index({"item": obj_id}, set())
+        self.repo.write_stage({"item": obj_id}, set())
         before = self.snapshot_disk()
         with self.assertRaisesRegex(GitletError, "paths conflict"):
             self.repo.commit("invalid")
@@ -163,7 +169,6 @@ class V2Tests(unittest.TestCase):
             outside.write_bytes(b"outside")
             (self.cwd / "src").symlink_to(other, target_is_directory=True)
             for operation in (lambda: self.repo.add("src/file"),
-                              lambda: self.repo.rm("src/file"),
                               lambda: self.repo.checkout_file("src/file"),
                               lambda: self.repo.reset(self.repo.head_id)):
                 with self.assertRaises(GitletError):
@@ -214,7 +219,7 @@ class V2Tests(unittest.TestCase):
 
     def test_v1_format_is_explicitly_rejected(self):
         (self.repo.directory / "format.json").unlink()
-        with self.assertRaisesRegex(GitletError, "expected version 2"):
+        with self.assertRaisesRegex(GitletError, "expected version 3"):
             self.repo.require_initialized()
 
 

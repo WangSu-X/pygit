@@ -5,9 +5,10 @@
 并阅读了 `https://github.com/cy-Yin/UCBerkeley-CS61B-sp18` 中的 Java 参考实现。
 
 需要 **Python 3.10 或更新版本**。运行和测试只使用标准库。
-已实现全部 13 个本地命令，以及 `status` 的两个选做栏目；远程命令未实现。
-Gitlet 支持仓库根目录及子目录的普通文件，例如 `gitlet add src/main.py`；一次暂存一个文件。
-当前使用 v2 对象格式：commit、tree、blob 统一存放于 `.gitlet/objects/`。
+提供 12 个本地命令；`add` 统一暂存新增、修改和删除，远程命令未实现。
+当前命令语义在课程 Gitlet 的基础上进行了调整。
+Gitlet 支持仓库根目录及子目录的普通文件。`add` 接受单个文件、目录或 `.`。
+当前使用 v3 仓库格式：commit、tree、blob 统一存放于 `.gitlet/objects/`。
 旧版仓库不能直接读取；本次重构没有提供自动迁移。
 
 ## 快速运行
@@ -104,9 +105,8 @@ python3 -m venv .venv
 | 命令 | 用途 |
 | --- | --- |
 | `gitlet init` | 初始化 `.gitlet`、`master` 和空的初始提交 |
-| `gitlet add 文件名` | 保存文件当前内容到暂存区，一次一个文件 |
+| `gitlet add 路径` | 将文件、目录或 `.` 范围内的新增、修改和删除同步到 Stage |
 | `gitlet commit "消息"` | 提交暂存的增加、修改和删除 |
-| `gitlet rm 文件名` | 取消新增暂存，或删除并暂存已跟踪文件 |
 | `gitlet log` | 沿当前提交的第一父链查看历史 |
 | `gitlet global-log` | 查看仓库中所有提交 |
 | `gitlet find "消息"` | 按完整消息查找提交 ID |
@@ -119,6 +119,17 @@ python3 -m venv .venv
 | `gitlet reset 提交ID` | 恢复指定提交，并移动当前分支指针 |
 | `gitlet merge 分支名` | 合并指定分支到当前分支 |
 
+删除文件后通过 `add` 暂存删除，不再提供 `gitlet rm`：
+
+```sh
+rm note.txt
+gitlet add note.txt
+# 或 gitlet add .，批量暂存新增、修改和删除
+gitlet commit "删除文件"
+```
+
+Stage 保存在 `.gitlet/stage.json`。`status` 分别显示已暂存变化、未暂存变化及未跟踪文件。
+
 恢复文件、切换分支、重置和合并会按规则改写工作文件。切换分支、重置和合并会事先检查可能被覆盖的未跟踪文件。
 单文件 `checkout` 可以覆盖普通文件。各命令的细节见中文说明。
 
@@ -130,9 +141,9 @@ python3 -m venv .venv
 - `gitlet/models.py`：blob、tree、commit 模型、稳定编码和日志格式。
 - `gitlet/objects.py`：统一对象库、压缩、哈希校验与提交 ID 查找。
 - `gitlet/trees.py`：目录快照查询与更新，复用未变化的子 tree。
-- `gitlet/refs.py` / `gitlet/index.py`：分支引用、HEAD 与暂存区。
+- `gitlet/refs.py` / `gitlet/stage.py`：分支引用、HEAD 与暂存区。
 - `gitlet/repository.py`：组织全部本地命令与工作目录操作。
-- `tests/test_gitlet.py` / `tests/test_v2.py`：命令行集成、提交图、对象格式、目录复用和覆盖保护测试。
+- `tests/test_gitlet.py` / `tests/test_v2.py` / `tests/test_stage.py`：命令行集成、提交图、对象格式、目录复用和覆盖保护测试。
 
 中文文档是为本 Python 实现独立编写的适配说明，不是原网页的全文逐段译本。
 原课程的 Java 自动评分器不能直接运行此 Python 入口；本项目使用自己的行为测试。

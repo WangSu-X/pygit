@@ -10,7 +10,7 @@ from .validation import validate_obj_id, validate_repo_path
 
 
 @dataclass
-class Index:
+class Stage:
     additions: dict[str, str] = field(default_factory=dict)
     removals: set[str] = field(default_factory=set)
 
@@ -32,35 +32,35 @@ class Index:
         self.additions.pop(path, None)
 
 
-class IndexStore:
+class StageStore:
     def __init__(self, path: Path):
         self.path = path
 
-    def read(self) -> Index:
+    def read(self) -> Stage:
         try:
             value = json.loads(self.path.read_bytes())
             if (set(value) != {"add", "remove"} or not isinstance(value["add"], dict)
                     or not isinstance(value["remove"], list)):
-                raise ValueError("Invalid index structure")
-            index = Index(value["add"], set(value["remove"]))
-            self._validate(index)
-            return index
+                raise ValueError("Invalid stage structure")
+            stage = Stage(value["add"], set(value["remove"]))
+            self._validate(stage)
+            return stage
         except (OSError, ValueError, TypeError, KeyError) as error:
-            raise GitletError("Invalid staging index.") from error
+            raise GitletError("Invalid stage.") from error
 
     @staticmethod
-    def _validate(index: Index) -> None:
-        if index.additions.keys() & index.removals:
-            raise GitletError("Invalid staging index.")
-        for path in index.additions.keys() | index.removals:
+    def _validate(stage: Stage) -> None:
+        if stage.additions.keys() & stage.removals:
+            raise GitletError("Invalid stage.")
+        for path in stage.additions.keys() | stage.removals:
             validate_repo_path(path)
-        for obj_id in index.additions.values():
+        for obj_id in stage.additions.values():
             validate_obj_id(obj_id)
 
-    def write(self, index: Index) -> None:
-        self._validate(index)
-        self.path.write_bytes(json_bytes({"add": index.additions,
-                                          "remove": sorted(index.removals)}))
+    def write(self, stage: Stage) -> None:
+        self._validate(stage)
+        self.path.write_bytes(json_bytes({"add": stage.additions,
+                                          "remove": sorted(stage.removals)}))
 
     def clear(self) -> None:
-        self.write(Index())
+        self.write(Stage())

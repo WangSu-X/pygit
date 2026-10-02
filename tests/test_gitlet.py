@@ -99,7 +99,7 @@ class GitletTests(unittest.TestCase):
         self.assertEqual(sum(isinstance(self.repo.objects.read(p.parent.name + p.name), Blob)
                              for p in self.repo.objects.directory.glob("*/*")), 1)
         self.assertEqual(self.repo.snapshot(first).keys(), {"a.txt"})
-        self.assertEqual(self.repo.read_index(), ({}, set()))
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
 
     def test_add_restages_and_unstages_reverted_content(self):
         self.init()
@@ -108,19 +108,20 @@ class GitletTests(unittest.TestCase):
         self.run_cli("add", "a.txt")
         self.write("a.txt", "changed again")
         self.run_cli("add", "a.txt")
-        self.assertEqual(self.repo.read_index()[0]["a.txt"], object_id(Blob(b"changed again")))
+        self.assertEqual(self.repo.read_stage()[0]["a.txt"], object_id(Blob(b"changed again")))
         self.write("a.txt", "base\n")
         self.run_cli("add", "a.txt")
-        self.assertEqual(self.repo.read_index(), ({}, set()))
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
         self.failure(("commit", "nothing"), "No changes added to the commit.")
 
     def test_add_cancels_removal(self):
         self.init()
         self.save()
-        self.run_cli("rm", "a.txt")
+        (self.cwd / "a.txt").unlink()
+        self.run_cli("add", "a.txt")
         self.write("a.txt", "base\n")
         self.run_cli("add", "a.txt")
-        self.assertEqual(self.repo.read_index(), ({}, set()))
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
 
     def test_missing_file_and_blank_commit_leave_state_unchanged(self):
         self.init()
@@ -130,19 +131,21 @@ class GitletTests(unittest.TestCase):
         for message in ("", "  \t"):
             self.failure(("commit", message), "Please enter a commit message.")
 
-    def test_rm_unstages_new_file_without_deleting_and_removes_tracked_file(self):
+    def test_add_missing_file_cancels_new_stage_and_stages_tracked_deletion(self):
         self.init()
         self.write("new.txt", "new")
         self.run_cli("add", "new.txt")
-        self.run_cli("rm", "new.txt")
-        self.assertTrue((self.cwd / "new.txt").exists())
+        (self.cwd / "new.txt").unlink()
+        self.run_cli("add", "new.txt")
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
         self.save()
-        self.run_cli("rm", "a.txt")
-        self.assertFalse((self.cwd / "a.txt").exists())
-        self.assertEqual(self.repo.read_index(), ({}, {"a.txt"}))
+        (self.cwd / "a.txt").unlink()
+        self.run_cli("add", "a.txt")
+        self.assertEqual(self.repo.read_stage(), ({}, {"a.txt"}))
         self.run_cli("commit", "remove a")
-        self.assertNotIn("a.txt", self.repo.snapshot(self.repo.head_id))
-        self.failure(("rm", "a.txt"), "No reason to remove the file.")
+        self.assertNotIn("a.txt", self.repo.snapshot())
+        self.failure(("add", "a.txt"), "File does not exist.")
+        self.failure(("rm", "a.txt"), "No command with that name exists.")
 
     def test_unstaged_deletion_does_not_change_snapshot(self):
         self.init()
@@ -154,17 +157,17 @@ class GitletTests(unittest.TestCase):
         self.run_cli("checkout", "--", "a.txt")
         self.assertEqual((self.cwd / "a.txt").read_text(), "base\n")
 
-    def test_checkout_file_by_prefix_preserves_index_and_branch(self):
+    def test_checkout_file_by_prefix_preserves_stage_and_branch(self):
         self.init()
         first = self.save()
         self.save(content="second", message="second")
         head = self.repo.head_id
         self.write("a.txt", "third")
         self.run_cli("add", "a.txt")
-        index = self.repo.read_index()
+        stage = self.repo.read_stage()
         self.run_cli("checkout", first[:12], "--", "a.txt")
         self.assertEqual((self.cwd / "a.txt").read_text(), "base\n")
-        self.assertEqual(self.repo.read_index(), index)
+        self.assertEqual(self.repo.read_stage(), stage)
         self.assertEqual(self.repo.head_id, head)
         self.failure(("checkout", "--", "absent"), "File does not exist in that commit.")
         self.failure(("checkout", "0" * 40, "--", "a.txt"), "No commit with that id exists.")
@@ -184,7 +187,7 @@ class GitletTests(unittest.TestCase):
             self.fail("Pigeonhole principle: expected a prefix collision")
         self.failure(("reset", prefix), "No commit with that id exists.")
 
-    def test_branches_switch_snapshots_and_clear_index(self):
+    def test_branches_switch_snapshots_and_clear_stage(self):
         self.init()
         initial = self.repo.head_id
         self.run_cli("branch", "dev")
@@ -196,7 +199,7 @@ class GitletTests(unittest.TestCase):
         self.run_cli("checkout", "dev")
         self.assertFalse((self.cwd / "a.txt").exists())
         self.assertTrue((self.cwd / "pending.txt").exists())
-        self.assertEqual(self.repo.read_index(), ({}, set()))
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
         self.assertEqual(self.repo.head_id, initial)
         self.save("dev.txt", "dev", "dev work")
         self.run_cli("checkout", "master")
@@ -236,7 +239,7 @@ class GitletTests(unittest.TestCase):
         self.assertFalse((self.cwd / "b.txt").exists())
         self.assertEqual((self.cwd / "untracked").read_text(), "keep")
         self.assertTrue(self.repo.objects.contains(second))
-        self.assertEqual(self.repo.read_index(), ({}, set()))
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
 
     def test_rm_branch_preserves_history(self):
         self.init()
@@ -264,7 +267,7 @@ class GitletTests(unittest.TestCase):
         self.assertEqual(set(found), {first, second})
         self.failure(("find", "sam"), "Found no commit with that message.")
 
-    def test_status_all_five_sections_and_no_duplicate_deletions(self):
+    def test_status_staged_types_and_no_duplicate_deletions(self):
         self.init()
         self.save("deleted.txt", "d", "d")
         self.save("changed.txt", "c", "c")
@@ -277,14 +280,14 @@ class GitletTests(unittest.TestCase):
         self.write("new.txt", "staged")
         self.run_cli("add", "new.txt")
         self.write("new.txt", "edited after staging")
-        self.run_cli("rm", "removed.txt")
+        (self.cwd / "removed.txt").unlink()
+        self.run_cli("add", "removed.txt")
         self.write("removed.txt", "recreated")
         self.write("unknown.txt", "u")
         (self.cwd / "ignored-directory").mkdir()
         self.run_cli("status", expected=(
             "=== Branches ===\naaa\n*master\n\n"
-            "=== Staged Files ===\ndeleted.txt\nnew.txt\n\n"
-            "=== Removed Files ===\nremoved.txt\n\n"
+            "=== Changes Staged For Commit ===\ndeleted.txt (modified)\nnew.txt (new)\nremoved.txt (deleted)\n\n"
             "=== Modifications Not Staged For Commit ===\n"
             "changed.txt (modified)\ndeleted.txt (deleted)\nnew.txt (modified)\n\n"
             "=== Untracked Files ===\nremoved.txt\nunknown.txt\n\n"))
@@ -295,7 +298,8 @@ class GitletTests(unittest.TestCase):
         self.run_cli("branch", "dev")
         self.failure(("merge", "master"), "Cannot merge a branch with itself.")
         self.failure(("merge", "missing"), "A branch with that name does not exist.")
-        self.run_cli("rm", "a.txt")
+        (self.cwd / "a.txt").unlink()
+        self.run_cli("add", "a.txt")
         self.failure(("merge", "dev"), "You have uncommitted changes.")
         self.write("b.txt", "b")
         self.run_cli("add", "b.txt")
@@ -337,7 +341,7 @@ class GitletTests(unittest.TestCase):
         self.assertIn(f"Merge: {left[:7]} {right[:7]}\n", log)
         self.assertNotIn(f"commit {right}\n", log)
         self.assertIn(f"commit {base}\n", log)
-        self.assertEqual(self.repo.read_index(), ({}, set()))
+        self.assertEqual(self.repo.read_stage(), ({}, set()))
 
     def test_merge_untracked_preflight_does_not_partially_restore_other_files(self):
         self.diverge()
