@@ -10,8 +10,8 @@ import zlib
 
 from gitlet.errors import GitletError
 from gitlet.models import Blob, Tree, object_id
+from gitlet.services import TreeService
 from gitlet.repository import Repository
-from gitlet.trees import apply_changes, flatten_tree, lookup_blob
 
 
 class V2Tests(unittest.TestCase):
@@ -28,67 +28,68 @@ class V2Tests(unittest.TestCase):
         target.write_bytes(content)
         self.repo.add(path)
         self.repo.commit(message)
-        return self.repo.head_id
+        return self.repo.head_commit_id
 
     def snapshot_disk(self):
         return {p.relative_to(self.cwd).as_posix(): p.read_bytes()
                 for p in self.cwd.rglob("*") if p.is_file() and not p.is_symlink()}
 
     def test_object_layout_header_hash_and_type_validation(self):
-        self.assertEqual(json.loads((self.repo.directory / "format.json").read_bytes()),
+        self.assertEqual(json.loads((self.repo.git_dir / "format.json").read_bytes()),
                          {"version": 3})
-        self.assertEqual((self.repo.directory / "HEAD").read_text(),
+        self.assertEqual((self.repo.git_dir / "HEAD").read_text(),
                          "ref: refs/heads/master\n")
-        self.assertEqual((self.repo.directory / "refs/heads/master").read_text().strip(),
-                         self.repo.head_id)
+        self.assertEqual((self.repo.git_dir / "refs/heads/master").read_text().strip(),
+                         self.repo.head_commit_id)
         blob = Blob(b"\0\xffhello")
-        obj_id = self.repo.objects.write(blob)
+        obj_id = self.repo.objects.save(blob)
         path = self.repo.objects.path_for(obj_id)
-        self.assertEqual(path, self.repo.directory / "objects" / obj_id[:2] / obj_id[2:])
+        self.assertEqual(path, self.repo.git_dir / "objects" / obj_id[:2] / obj_id[2:])
         self.assertEqual(zlib.decompress(path.read_bytes()), b"blob 7\0\0\xffhello")
-        self.assertEqual(self.repo.objects.read_blob(obj_id), blob)
+        self.assertEqual(self.repo.objects.load_blob(obj_id), blob)
         with self.assertRaises(GitletError):
-            self.repo.objects.read_tree(obj_id)
+            self.repo.objects.load_tree(obj_id)
         with self.assertRaises(GitletError):
-            self.repo.resolve_id(obj_id)
+            self.repo.resolve_commit_id(obj_id)
         self.assertNotEqual(object_id(Blob(b'{"entries":{}}')), object_id(Tree(())))
         self.assertEqual(len(list(self.repo.objects.iter_commit_ids())), 1)
         before = path.read_bytes()
-        self.repo.objects.write(blob)
+        self.repo.objects.save(blob)
         self.assertEqual(path.read_bytes(), before)
 
     def test_corrupt_object_is_rejected(self):
-        obj_id = self.repo.save_blob(b"hello")
+        obj_id = self.repo.objects.save(Blob(b"hello"))
         path = self.repo.objects.path_for(obj_id)
         for content in (b"not zlib", zlib.compress(b"blob 4\0hello"),
                         zlib.compress(b"blob 5\0other")):
             path.write_bytes(content)
             with self.assertRaises(GitletError):
-                self.repo.objects.read(obj_id)
+                self.repo.objects.load(obj_id)
             with self.assertRaises(GitletError):
-                self.repo.save_blob(b"hello")
+                self.repo.objects.save(Blob(b"hello"))
 
     def test_nested_tree_reuses_unchanged_subtrees(self):
         self.save("src/main.py", b"first")
         self.save("docs/guide.txt", b"guide")
-        old = self.repo.read_commit(self.repo.head_id)
-        entries = {e.name: e for e in self.repo.objects.read_tree(old.tree).entries}
+        old = self.repo.objects.load_commit(self.repo.head_commit_id)
+        entries = {e.name: e for e in self.repo.objects.load_tree(old.tree).entries}
         self.save("src/main.py", b"second")
-        new = self.repo.read_commit(self.repo.head_id)
-        updated = {e.name: e for e in self.repo.objects.read_tree(new.tree).entries}
+        new = self.repo.objects.load_commit(self.repo.head_commit_id)
+        updated = {e.name: e for e in self.repo.objects.load_tree(new.tree).entries}
         self.assertNotEqual(old.tree, new.tree)
         self.assertNotEqual(entries["src"].obj_id, updated["src"].obj_id)
         self.assertEqual(entries["docs"].obj_id, updated["docs"].obj_id)
-        self.assertEqual(self.repo.blob_content(lookup_blob(self.repo.objects, old.tree,
+        tree_service = TreeService(self.repo.objects)
+        self.assertEqual(self.repo.blob_content(tree_service.lookup_blob(old.tree,
                                                           "src/main.py")), b"first")
-        self.assertEqual(flatten_tree(self.repo.objects, new.tree), self.repo.snapshot())
+        self.assertEqual(tree_service.flatten(new.tree), self.repo.snapshot())
         before = self.snapshot_disk()
-        self.assertEqual(apply_changes(self.repo.objects, new.tree, {}, set()), new.tree)
+        self.assertEqual(tree_service.apply_changes(new.tree, {}, set()), new.tree)
         self.assertEqual(before, self.snapshot_disk())
         (self.cwd / "src/main.py").unlink()
         self.repo.add("src/main.py")
         self.repo.commit("remove source")
-        root = self.repo.objects.read_tree(self.repo.read_commit(self.repo.head_id).tree)
+        root = self.repo.objects.load_tree(self.repo.objects.load_commit(self.repo.head_commit_id).tree)
         self.assertEqual([e.name for e in root.entries], ["docs"])
 
     def test_nested_branch_checkout_reset_and_status(self):
@@ -106,8 +107,8 @@ class V2Tests(unittest.TestCase):
         self.assertIn("src/main.py (modified)", output.getvalue())
         self.assertIn("src/untracked", output.getvalue())
         self.repo.reset(second)
-        self.assertEqual(self.repo.head_id, second)
-        self.assertEqual(self.repo.read_branch("master"), second)
+        self.assertEqual(self.repo.head_commit_id, second)
+        self.assertEqual(self.repo.refs.resolve_branch("master"), second)
         self.repo.checkout_file("src/main.py", first[:12])
         self.assertEqual((self.cwd / "src/main.py").read_bytes(), b"first")
         self.repo.checkout_branch("master")
@@ -170,7 +171,7 @@ class V2Tests(unittest.TestCase):
             (self.cwd / "src").symlink_to(other, target_is_directory=True)
             for operation in (lambda: self.repo.add("src/file"),
                               lambda: self.repo.checkout_file("src/file"),
-                              lambda: self.repo.reset(self.repo.head_id)):
+                              lambda: self.repo.reset(self.repo.head_commit_id)):
                 with self.assertRaises(GitletError):
                     operation()
                 self.assertEqual(outside.read_bytes(), b"outside")
@@ -194,15 +195,16 @@ class V2Tests(unittest.TestCase):
         right = self.save("docs/right", b"right")
         self.repo.checkout_branch("master")
         self.repo.merge("dev")
-        commit = self.repo.read_commit(self.repo.head_id)
+        commit = self.repo.objects.load_commit(self.repo.head_commit_id)
         self.assertEqual(commit.parents, (left, right))
         self.assertEqual(set(self.repo.snapshot()), {"src/base", "src/left", "docs/right"})
         self.assertEqual((self.cwd / "docs/right").read_bytes(), b"right")
 
     def test_removing_absent_descendant_does_not_remove_existing_file(self):
         self.save("item", b"keep")
-        root = self.repo.read_commit(self.repo.head_id).tree
-        self.assertEqual(apply_changes(self.repo.objects, root, {}, {"item/missing"}),
+        root = self.repo.objects.load_commit(self.repo.head_commit_id).tree
+        tree_service = TreeService(self.repo.objects)
+        self.assertEqual(tree_service.apply_changes(root, {}, {"item/missing"}),
                          root)
 
     def test_merge_directory_conflict_is_rejected_before_any_changes(self):
@@ -218,7 +220,7 @@ class V2Tests(unittest.TestCase):
         self.assertEqual(before, self.snapshot_disk())
 
     def test_v1_format_is_explicitly_rejected(self):
-        (self.repo.directory / "format.json").unlink()
+        (self.repo.git_dir / "format.json").unlink()
         with self.assertRaisesRegex(GitletError, "expected version 3"):
             self.repo.require_initialized()
 

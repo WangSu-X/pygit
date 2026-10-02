@@ -2,7 +2,8 @@
 
 import sys
 
-from .repository import GitletError, Repository
+from .errors import GitletError
+from .repository import Repository
 
 
 COMMANDS = {

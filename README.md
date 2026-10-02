@@ -135,15 +135,44 @@ Stage 保存在 `.gitlet/stage.json`。`status` 分别显示已暂存变化、�
 
 ## 文档和代码
 
-- [中文 Python 项目说明](docs/PROJECT.zh-CN.md)：运行方式、数据概念、各命令规则、合并示例、测试与选做范围。
-- [设计说明](docs/DESIGN.zh-CN.md)：类、磁盘格式、SHA-1、合并算法和复杂度。
-- `gitlet/cli.py`：参数检查和命令分发。
-- `gitlet/models.py`：blob、tree、commit 模型、稳定编码和日志格式。
-- `gitlet/objects.py`：统一对象库、压缩、哈希校验与提交 ID 查找。
-- `gitlet/trees.py`：目录快照查询与更新，复用未变化的子 tree。
-- `gitlet/refs.py` / `gitlet/stage.py`：分支引用、HEAD 与暂存区。
-- `gitlet/repository.py`：组织全部本地命令与工作目录操作。
-- `tests/test_gitlet.py` / `tests/test_v2.py` / `tests/test_stage.py`：命令行集成、提交图、对象格式、目录复用和覆盖保护测试。
+### 文档
+
+- [中文 Python 项目说明](docs/PROJECT.zh-CN.md)：运行方式、数据概念、各命令规则、合并示例、测试与选做范围
+- [设计说明](docs/design.md)：类、磁盘格式、SHA-1、合并算法和复杂度
+
+### 项目架构
+
+项目采用**四层分层架构**，代码组织清晰：
+
+```
+gitlet/
+├── models/              # 数据模型层 - 核心实体
+│   └── objects.py       # Blob, Tree, Commit
+├── storage/             # 存储层 - 持久化操作
+│   ├── object_store.py  # 对象存储（压缩、哈希校验）
+│   ├── ref_store.py     # 分支引用、HEAD
+│   └── stage_store.py   # 暂存区
+├── services/            # 业务逻辑层 - 复杂算法
+│   ├── tree_service.py  # 目录快照查询与更新
+│   └── merge_service.py # 三方合并算法
+├── repository.py        # 协调层 - 统一对外接口
+├── cli.py               # 命令行入口
+└── utils.py             # 工具函数
+```
+
+**依赖方向**：`repository → services → storage → models`
+
+- **models/**：定义核心实体（blob、tree、commit），稳定编码和日志格式
+- **storage/**：负责持久化操作，包括对象库、引用管理、暂存区
+- **services/**：实现跨实体的复杂业务逻辑（树遍历、合并算法）
+- **repository.py**：组织全部本地命令，协调各层，处理工作目录操作
+- **cli.py**：参数检查和命令分发
+
+### 测试
+
+- `tests/test_gitlet.py`：命令行集成测试
+- `tests/test_v2.py`：提交图和对象格式测试
+- `tests/test_stage.py`：目录复用和覆盖保护测试
 
 中文文档是为本 Python 实现独立编写的适配说明，不是原网页的全文逐段译本。
 原课程的 Java 自动评分器不能直接运行此 Python 入口；本项目使用自己的行为测试。
@@ -154,9 +183,11 @@ Python 与参考 Java 的 `.gitlet` 存储格式及提交 ID 不互通。
 在项目目录运行：
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3 -m pytest tests/ -v
 # 或
-make check
+make test          # 详细输出
+make test-quick    # 简洁输出
 ```
 
 测试不在项目目录初始化 `.gitlet`，每个测试使用独立临时目录。
+所有 49 个测试必须通过。

@@ -1,29 +1,19 @@
-"""Immutable blob, tree and commit models with canonical object encoding."""
+"""不可变的数据实体。"""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
-import json
 from typing import Literal, TypeAlias
 
-from .validation import validate_component, validate_obj_id
+from ..utils import validate_component, validate_obj_id, sha1, json_bytes
 
 ObjectId: TypeAlias = str
 RepoPath: TypeAlias = str
 ObjectType: TypeAlias = Literal["blob", "tree", "commit"]
 
 
-def sha1(data: bytes) -> str:
-    return hashlib.sha1(data).hexdigest()
-
-
-def json_bytes(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, ensure_ascii=True,
-                      separators=(",", ":")).encode("utf-8")
-
-
 @dataclass(frozen=True)
 class Blob:
+    """文件内容的不可变表示。"""
     content: bytes
 
     def __post_init__(self):
@@ -33,6 +23,7 @@ class Blob:
 
 @dataclass(frozen=True)
 class TreeEntry:
+    """树条目：指向 blob 或子树。"""
     name: str
     type: Literal["blob", "tree"]
     obj_id: ObjectId
@@ -46,6 +37,7 @@ class TreeEntry:
 
 @dataclass(frozen=True)
 class Tree:
+    """目录快照的不可变表示。"""
     entries: tuple[TreeEntry, ...]
 
     def __post_init__(self):
@@ -57,6 +49,7 @@ class Tree:
 
 @dataclass(frozen=True)
 class Commit:
+    """提交的不可变表示。"""
     message: str
     timestamp: int
     parents: tuple[ObjectId, ...]
@@ -73,17 +66,21 @@ class Commit:
             validate_obj_id(parent)
 
     def to_bytes(self) -> bytes:
+        """序列化为字节。"""
         return encode_payload(self)
 
     @property
     def id(self) -> ObjectId:
+        """提交的唯一标识。"""
         return object_id(self)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Commit":
+        """从字节反序列化。"""
         return decode_payload("commit", data)
 
     def log_entry(self) -> str:
+        """格式化为日志条目。"""
         date = datetime.fromtimestamp(self.timestamp // 1_000_000_000,
                                       timezone.utc).astimezone()
         day = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[date.weekday()]
@@ -101,6 +98,7 @@ GitObject: TypeAlias = Blob | Tree | Commit
 
 
 def object_type(obj: GitObject) -> ObjectType:
+    """返回对象类型。"""
     if isinstance(obj, Blob):
         return "blob"
     if isinstance(obj, Tree):
@@ -111,6 +109,7 @@ def object_type(obj: GitObject) -> ObjectType:
 
 
 def encode_payload(obj: GitObject) -> bytes:
+    """编码对象的有效载荷。"""
     if isinstance(obj, Blob):
         return obj.content
     if isinstance(obj, Tree):
@@ -123,8 +122,10 @@ def encode_payload(obj: GitObject) -> bytes:
 
 
 def decode_payload(kind: ObjectType, payload: bytes) -> GitObject:
+    """从有效载荷解码对象。"""
     if kind == "blob":
         return Blob(payload)
+    import json
     value = json.loads(payload)
     if kind == "tree":
         if set(value) != {"entries"} or not isinstance(value["entries"], dict):
@@ -149,9 +150,16 @@ def decode_payload(kind: ObjectType, payload: bytes) -> GitObject:
 
 
 def encode_object(obj: GitObject) -> bytes:
+    """编码完整的 Git 对象（包含头部）。"""
     payload = encode_payload(obj)
     return f"{object_type(obj)} {len(payload)}\0".encode("ascii") + payload
 
 
 def object_id(obj: GitObject) -> ObjectId:
+    """计算对象的 ID（内容哈希）。"""
     return sha1(encode_object(obj))
+
+
+def make_tree(entries: list[TreeEntry]) -> Tree:
+    """从条目列表创建树（会自动排序和去重）。"""
+    return Tree(tuple(entries))

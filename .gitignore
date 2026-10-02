@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.gitlet/
+.venv/
+*.egg-info/
+build/
+dist/
+workerspace/
