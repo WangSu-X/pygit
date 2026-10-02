@@ -196,20 +196,33 @@ def save_new_object(self, obj: NewObject) -> str:
 
 ### 测试组织
 
-- **tests/test_gitlet.py** (500+ 行)
-  - 命令行集成测试
+- **tests/test_commands.py** (24 tests)
+  - CLI 命令集成测试
   - 覆盖所有 12 个命令
-  - 包含复杂的提交图场景
+  - 错误处理和参数验证
 
-- **tests/test_v2.py** (300+ 行)
-  - 对象格式测试
-  - 序列化/反序列化测试
-  - 提交图遍历测试
+- **tests/test_repository.py** (23 tests)
+  - Repository 核心功能
+  - 对象存储和序列化
+  - 树操作和子树复用
+  - 文件/目录替换
 
-- **tests/test_stage.py** (200+ 行)
-  - 暂存区逻辑测试
-  - 目录复用测试
-  - 覆盖保护测试
+- **tests/test_merge.py** (16 tests)
+  - 三方合并算法
+  - 冲突检测和标记
+  - 快进合并
+  - 祖先查找（LCA）
+
+- **tests/test_staging.py** (11 tests)
+  - 暂存区功能
+  - 批量添加操作
+  - 状态显示
+
+- **tests/test_security.py** (10 tests)
+  - 路径验证
+  - symlink 保护
+  - 未跟踪文件保护
+  - 路径冲突检测
 
 ### 测试最佳实践
 
@@ -393,7 +406,3 @@ A: 不能。`.gitlet` 和 `.git` 是独立的，对象格式也不完全兼容�
 ### Q: 如何调试复杂的合并冲突？
 
 A: 在 `merge_service.py` 中添加日志，打印三方合并的每一步决策。使用 `--pdb` 选项在测试失败时进入调试器。
-
----
-
-**最后更新**：2024-10-02
