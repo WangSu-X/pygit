@@ -10,7 +10,8 @@ import sys
 import tempfile
 import unittest
 
-from gitlet.models import Commit, sha1
+from gitlet.models import Blob, Commit, Tree, TreeEntry, object_id
+from gitlet.trees import apply_changes, make_tree
 from gitlet.repository import Repository, UNTRACKED
 
 
@@ -36,6 +37,7 @@ class GitletTests(unittest.TestCase):
 
     def write(self, name, content):
         path = self.cwd / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content if isinstance(content, bytes) else content.encode())
 
     def snapshot(self):
@@ -73,7 +75,7 @@ class GitletTests(unittest.TestCase):
     def test_initial_commit_and_identical_ids_across_repositories(self):
         self.init()
         initial = self.repo.read_commit(self.repo.head_id)
-        self.assertEqual((initial.message, initial.timestamp, initial.parents, initial.files),
+        self.assertEqual((initial.message, initial.timestamp, initial.parents, self.repo.snapshot()),
                          ("initial commit", 0, (), {}))
         self.assertEqual(self.repo.branch_name, "master")
         with tempfile.TemporaryDirectory() as other:
@@ -94,8 +96,9 @@ class GitletTests(unittest.TestCase):
         self.run_cli("checkout", "--", "a.txt")
         self.assertEqual((self.cwd / "a.txt").read_bytes(), b"\x00\xffstaged\r\n")
         self.save("b.txt", b"\x00\xffstaged\r\n", "same blob, two names")
-        self.assertEqual(len(list(self.repo.blobs.iterdir())), 1)
-        self.assertEqual(self.repo.read_commit(first).files.keys(), {"a.txt"})
+        self.assertEqual(sum(isinstance(self.repo.objects.read(p.parent.name + p.name), Blob)
+                             for p in self.repo.objects.directory.glob("*/*")), 1)
+        self.assertEqual(self.repo.snapshot(first).keys(), {"a.txt"})
         self.assertEqual(self.repo.read_index(), ({}, set()))
 
     def test_add_restages_and_unstages_reverted_content(self):
@@ -105,7 +108,7 @@ class GitletTests(unittest.TestCase):
         self.run_cli("add", "a.txt")
         self.write("a.txt", "changed again")
         self.run_cli("add", "a.txt")
-        self.assertEqual(self.repo.read_index()[0]["a.txt"], sha1(b"changed again"))
+        self.assertEqual(self.repo.read_index()[0]["a.txt"], object_id(Blob(b"changed again")))
         self.write("a.txt", "base\n")
         self.run_cli("add", "a.txt")
         self.assertEqual(self.repo.read_index(), ({}, set()))
@@ -138,7 +141,7 @@ class GitletTests(unittest.TestCase):
         self.assertFalse((self.cwd / "a.txt").exists())
         self.assertEqual(self.repo.read_index(), ({}, {"a.txt"}))
         self.run_cli("commit", "remove a")
-        self.assertNotIn("a.txt", self.repo.read_commit(self.repo.head_id).files)
+        self.assertNotIn("a.txt", self.repo.snapshot(self.repo.head_id))
         self.failure(("rm", "a.txt"), "No reason to remove the file.")
 
     def test_unstaged_deletion_does_not_change_snapshot(self):
@@ -146,8 +149,8 @@ class GitletTests(unittest.TestCase):
         first = self.save()
         (self.cwd / "a.txt").unlink()
         self.save("b.txt", "b", "add b")
-        self.assertEqual(self.repo.read_commit(first).files["a.txt"],
-                         self.repo.read_commit(self.repo.head_id).files["a.txt"])
+        self.assertEqual(self.repo.snapshot(first)["a.txt"],
+                         self.repo.snapshot(self.repo.head_id)["a.txt"])
         self.run_cli("checkout", "--", "a.txt")
         self.assertEqual((self.cwd / "a.txt").read_text(), "base\n")
 
@@ -171,7 +174,7 @@ class GitletTests(unittest.TestCase):
         self.init()
         seen = {}
         for n in range(30):
-            commit = Commit(f"candidate {n}", n, (self.repo.head_id,), {})
+            commit = Commit(f"candidate {n}", n, (self.repo.head_id,), self.repo.read_commit(self.repo.head_id).tree)
             self.repo.save_commit(commit)
             prefix = commit.id[0]
             if prefix in seen:
@@ -232,7 +235,7 @@ class GitletTests(unittest.TestCase):
         self.assertEqual(self.repo.read_branch("future"), second)
         self.assertFalse((self.cwd / "b.txt").exists())
         self.assertEqual((self.cwd / "untracked").read_text(), "keep")
-        self.assertTrue((self.repo.commits / second).exists())
+        self.assertTrue(self.repo.objects.contains(second))
         self.assertEqual(self.repo.read_index(), ({}, set()))
 
     def test_rm_branch_preserves_history(self):
@@ -242,7 +245,7 @@ class GitletTests(unittest.TestCase):
         old = self.save(message="only feature")
         self.run_cli("checkout", "master")
         self.run_cli("rm-branch", "feature/a")
-        self.assertTrue((self.repo.commits / old).exists())
+        self.assertTrue(self.repo.objects.contains(old))
         self.failure(("rm-branch", "master"), "Cannot remove the current branch.")
         self.failure(("rm-branch", "missing"), "A branch with that name does not exist.")
 
@@ -328,7 +331,7 @@ class GitletTests(unittest.TestCase):
         merged = self.repo.read_commit(self.repo.head_id)
         self.assertEqual(merged.parents, (left, right))
         self.assertEqual(merged.message, "Merged dev into master.")
-        self.assertEqual(set(merged.files), {"a.txt", "left.txt", "right.txt"})
+        self.assertEqual(set(self.repo.snapshot()), {"a.txt", "left.txt", "right.txt"})
         self.assertEqual(self.repo.read_branch("dev"), right)
         log = self.run_cli("log", expected=None)
         self.assertIn(f"Merge: {left[:7]} {right[:7]}\n", log)
@@ -355,7 +358,7 @@ class GitletTests(unittest.TestCase):
         self.assertEqual((self.cwd / "a.txt").read_bytes(), expected)
         merged = self.repo.read_commit(self.repo.head_id)
         self.assertEqual(merged.parents, (left, right))
-        self.assertEqual(self.repo.blob_content(merged.files["a.txt"]), expected)
+        self.assertEqual(self.repo.blob_content(self.repo.snapshot()["a.txt"]), expected)
         self.assertEqual((self.cwd / "z.txt").read_text(), "nonconflict")
 
     def test_merge_with_no_snapshot_changes_is_an_error(self):
@@ -400,7 +403,7 @@ class GitletTests(unittest.TestCase):
                         result = {extra: repo.save_blob(extra.encode())} if extra else {}
                         if value is not None:
                             result["a.txt"] = repo.save_blob(value)
-                        return result
+                        return apply_changes(repo.objects, repo.objects.write(Tree(())), result, set())
                     b = Commit("base", 1, (repo.head_id,), tree(base, ""))
                     c = Commit("current", 2, (b.id,), tree(current, "left"))
                     g = Commit("given", 3, (b.id,), tree(given, "right"))
@@ -408,7 +411,7 @@ class GitletTests(unittest.TestCase):
                         repo.save_commit(commit)
                     repo.write_branch("master", c.id)
                     repo.write_branch("dev", g.id)
-                    for name, blob_id in c.files.items():
+                    for name, blob_id in repo.snapshot(c.id).items():
                         (repo.cwd / name).write_bytes(repo.blob_content(blob_id))
                     # A file deleted on both branches may be recreated as untracked.
                     if base is not None and current is None and given is None:
@@ -418,7 +421,7 @@ class GitletTests(unittest.TestCase):
                         repo.merge("dev")
                     self.assertEqual(output.getvalue(),
                                      "Encountered a merge conflict.\n" if conflict else "")
-                    files = repo.read_commit(repo.head_id).files
+                    files = repo.snapshot()
                     if expected is None:
                         self.assertNotIn("a.txt", files)
                     else:
@@ -431,7 +434,7 @@ class GitletTests(unittest.TestCase):
         self.init()
         root = self.repo.head_id
         def node(message, *parents):
-            commit = Commit(message, 1, parents, {})
+            commit = Commit(message, 1, parents, self.repo.read_commit(root).tree)
             self.repo.save_commit(commit)
             return commit.id
         a = node("a", root)
@@ -449,18 +452,21 @@ class GitletTests(unittest.TestCase):
         self.init()
         root = parent = self.repo.head_id
         for n in range(1100):
-            commit = Commit(str(n), n, (parent,), {})
+            commit = Commit(str(n), n, (parent,), self.repo.read_commit(root).tree)
             self.repo.save_commit(commit)
             parent = commit.id
         self.assertEqual(self.repo.split_point(parent, root), root)
 
-    def test_commit_hash_uses_all_metadata_and_is_independent_of_dict_order(self):
-        first = Commit("m", 1, ("p", "q"), {"a": "x", "b": "y"})
-        self.assertEqual(first.id, Commit("m", 1, ("p", "q"), {"b": "y", "a": "x"}).id)
-        for other in [Commit("n", 1, ("p", "q"), first.files),
-                      Commit("m", 2, ("p", "q"), first.files),
-                      Commit("m", 1, ("q", "p"), first.files),
-                      Commit("m", 1, ("p", "q"), {"a": "z", "b": "y"})]:
+    def test_commit_hash_uses_all_metadata_and_tree_order_is_stable(self):
+        a, b = object_id(Blob(b"a")), object_id(Blob(b"b"))
+        tree = make_tree([TreeEntry("a", "blob", a), TreeEntry("b", "blob", b)])
+        reverse = make_tree(list(reversed(tree.entries)))
+        self.assertEqual(object_id(tree), object_id(reverse))
+        first = Commit("m", 1, (a, b), object_id(tree))
+        for other in [Commit("n", 1, (a, b), first.tree),
+                      Commit("m", 2, (a, b), first.tree),
+                      Commit("m", 1, (b, a), first.tree),
+                      Commit("m", 1, (a, b), object_id(Tree(())))]:
             self.assertNotEqual(first.id, other.id)
         self.assertEqual(first, Commit.from_bytes(first.to_bytes()))
 

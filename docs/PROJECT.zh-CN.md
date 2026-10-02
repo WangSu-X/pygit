@@ -7,15 +7,16 @@
 ## 1. 学习目标与范围
 
 你要实现的程序名为 Gitlet。它为文件集合保存历史版本，可以恢复文件、维护不同开发分支，
-并把两个分支的变化合到一起。一个提交保存的是完整的“文件名 → 内容版本”快照。
+并把两个分支的变化合到一起。一个提交引用根 tree，根 tree 及其子 tree 表示完整的文件快照。
 
 本项目包含 13 个本地命令：`init`、`add`、`commit`、`rm`、`log`、`global-log`、
 `find`、`status`、`checkout`、`branch`、`rm-branch`、`reset`、`merge`。
 `checkout` 有三种参数形式。`status` 完整显示五个栏目。
 `add-remote`、`rm-remote`、`push`、`fetch`、`pull` 是后续扩展，本实现没有包含它们。
 
-使用 Python 3.10+ 和标准库即可。仓库只处理当前目录中的普通文件，忽略子目录。
-文件参数只能是单个文件名，例如 `note.txt`，不能是 `src/note.txt`、绝对路径或 `../note.txt`。
+使用 Python 3.10+ 和标准库即可。仓库支持子目录中的普通文件。
+文件参数使用相对仓库根目录的路径，例如 `note.txt` 或 `src/note.txt`，不能使用绝对路径或 `../note.txt`。
+`add` 与 `rm` 一次处理一个文件，不接受目录参数。当前仓库格式为 v2；旧格式需另行迁移。
 不追踪符号链接、权限和空目录，不提供真实 Git 的网络协议或 detached HEAD 模式。
 
 ## 2. 启动与运行约定
@@ -49,18 +50,19 @@ python3 /workspace/pygit/gitlet_cli.py 命令 参数...
 课程规定的命令错误打印到标准输出，保留英文及句末标点，进程退出码为 0。
 预期失败不会留下半完成的工作区或元数据修改。磁盘损坏、断电和并发执行不属于此学习实现的事务保证范围。
 
-## 3. 五个核心概念
+## 3. 核心概念
 
 | 概念 | 在本实现中的含义 |
 | --- | --- |
 | 工作目录 working directory | 用户正在编辑的普通文件所在目录 |
-| 文件对象 blob | 某个文件版本的原始字节内容；ID 是内容的 SHA-1 |
+| 文件对象 blob | 某个文件版本的原始字节内容；ID 是对象头部与内容的 SHA-1 |
 | 暂存区 staging area | 下一次提交准备采用的文件版本及待删除的文件名 |
-| 提交 commit | 消息、时间、零到两个父提交 ID，以及文件名到 blob ID 的映射 |
-| 分支 branch / HEAD | 分支名对应一个提交 ID；HEAD 记录当前分支名 |
+| 目录对象 tree | 当前目录下的名称、对象类型与 blob / 子 tree ID |
+| 提交 commit | 消息、时间、零到两个父提交 ID，以及根 tree ID |
+| 分支 branch / HEAD | 分支名对应一个提交 ID；HEAD 保存当前分支的符号引用 |
 
 `add` 保存的是执行当时的文件内容。之后再编辑文件，不会自动更新暂存区。
-`commit` 从父提交复制文件映射，再应用暂存变化；未暂存的工作目录变化不会进入提交。
+`commit` 向父提交的 tree 应用暂存变化，复用未变化的目录对象；未暂存的工作目录变化不会进入提交。
 
 例如：
 
@@ -87,7 +89,7 @@ flowchart RL
 ```
 
 已保存的提交和 blob 不会因 `reset` 或删除分支被删除。相同文件内容共享 blob，
-不同提交仍各自保存文件映射。提交 ID 是 40 位小写十六进制字符串，不与真实 Git 或 Java 版互通。
+不同提交引用各自的根 tree，并可复用未变化的子 tree。提交 ID 是 40 位小写十六进制字符串，不与真实 Git 或 Java 版互通。
 
 ## 4. 本地命令
 
@@ -430,13 +432,15 @@ python3 -m unittest discover -s tests -k merge -v
 python3 -m pdb /workspace/pygit/gitlet_cli.py status
 ```
 
-元数据可直接阅读：
+HEAD 与暂存区可直接阅读：
 
 ```sh
 cat .gitlet/HEAD
 python3 -m json.tool .gitlet/index.json
-python3 -m json.tool .gitlet/commits/完整提交ID
 ```
+
+对象保存在 `.gitlet/objects/<ID 前两位>/<ID 剩余部分>`，使用 zlib 压缩。
+可通过 `Repository.objects.read(完整对象ID)` 查看解析后的对象。
 
 日志顺序不对时检查父提交链接；文件恢复不对时检查 blob ID 和原始字节；
 `status` 不对时先检查前面的 `add` 或 `rm` 是否正确保存了暂存区。

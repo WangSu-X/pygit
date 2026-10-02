@@ -2,28 +2,24 @@
 
 from collections import deque
 import json
+import os
 from pathlib import Path
-import re
 import time
-from urllib.parse import quote, unquote
 
-from .models import Commit, json_bytes, sha1
-
-
-class GitletError(Exception):
-    """An expected command failure, printed without a traceback by the CLI."""
+from .errors import GitletError
+from .index import Index, IndexStore
+from .models import Blob, Commit, Tree, json_bytes, object_id
+from .objects import ObjectStore
+from .refs import RefStore
+from .trees import apply_changes, flatten_tree, lookup_blob, validate_snapshot
+from .validation import validate_repo_path
 
 
 UNTRACKED = ("There is an untracked file in the way; "
              "delete it, or add and commit it first.")
 
 
-def file_name(name: str) -> str:
-    """Only flat working-directory files belong to the exercise."""
-    if (not name or name in {".", "..", ".gitlet"}
-            or "/" in name or "\\" in name or "\0" in name):
-        raise GitletError("Incorrect operands.")
-    return name
+file_name = validate_repo_path
 
 
 def name_order(name: str) -> bytes:
@@ -35,99 +31,105 @@ class Repository:
     def __init__(self, cwd: Path | None = None):
         self.cwd = Path.cwd() if cwd is None else Path(cwd)
         self.directory = self.cwd / ".gitlet"
-        self.commits = self.directory / "commits"
-        self.blobs = self.directory / "blobs"
-        self.branches = self.directory / "branches"
-        self.head_file = self.directory / "HEAD"
-        self.index_file = self.directory / "index.json"
+        self.objects = ObjectStore(self.directory / "objects")
+        self.refs = RefStore(self.directory)
+        self.index = IndexStore(self.directory / "index.json")
 
     def require_initialized(self) -> None:
         if not self.directory.is_dir():
             raise GitletError("Not in an initialized Gitlet directory.")
+        try:
+            version = json.loads((self.directory / "format.json").read_bytes())
+        except (OSError, ValueError):
+            raise GitletError("Unsupported repository format; expected version 2.") from None
+        if version != {"version": 2}:
+            raise GitletError("Unsupported repository format; expected version 2.")
 
     def init(self) -> None:
         if self.directory.exists():
             raise GitletError("A Gitlet version-control system already exists "
                               "in the current directory.")
         self.directory.mkdir()
-        for directory in (self.commits, self.blobs, self.branches):
-            directory.mkdir()
-        initial = Commit("initial commit", 0, (), {})
+        self.objects.directory.mkdir()
+        self.refs.heads.mkdir(parents=True)
+        (self.directory / "format.json").write_bytes(json_bytes({"version": 2}))
+        root = self.objects.write(Tree(()))
+        initial = Commit("initial commit", 0, (), root)
         self.save_commit(initial)
         self.write_branch("master", initial.id)
-        self.head_file.write_text("master", encoding="utf-8")
-        self.write_index({}, set())
+        self.refs.set_head("master")
+        self.index.clear()
 
     @property
     def branch_name(self) -> str:
-        return self.head_file.read_text(encoding="utf-8")
+        return self.refs.current_branch()
 
     @property
     def head_id(self) -> str:
-        return self.read_branch(self.branch_name)
+        return self.refs.head_id()
 
     def branch_path(self, name: str) -> Path:
-        if not name or "\0" in name:
-            raise GitletError("Incorrect operands.")
-        # Prefix avoids '.'/'..'; encoding lets names like 'feature/a' stay flat.
-        return self.branches / ("ref-" + quote(name, safe=""))
+        return self.refs.branch_path(name)
 
     def read_branch(self, name: str) -> str:
-        return self.branch_path(name).read_text(encoding="utf-8")
+        return self.refs.read_branch(name)
 
     def write_branch(self, name: str, commit_id: str) -> None:
-        self.branch_path(name).write_text(commit_id, encoding="utf-8")
+        self.objects.read_commit(commit_id)
+        self.refs.write_branch(name, commit_id)
 
     def read_commit(self, commit_id: str) -> Commit:
-        return Commit.from_bytes((self.commits / commit_id).read_bytes())
+        return self.objects.read_commit(commit_id)
 
     def save_commit(self, commit: Commit) -> None:
-        path = self.commits / commit.id
-        if not path.exists():
-            path.write_bytes(commit.to_bytes())
+        self.objects.read_tree(commit.tree)
+        self.objects.write(commit)
+
+    def snapshot(self, commit_id: str | None = None) -> dict[str, str]:
+        commit = self.read_commit(self.head_id if commit_id is None else commit_id)
+        return flatten_tree(self.objects, commit.tree)
 
     def resolve_id(self, prefix: str) -> str:
-        if not re.fullmatch(r"[0-9a-f]{1,40}", prefix):
-            raise GitletError("No commit with that id exists.")
-        if len(prefix) == 40:
-            if (self.commits / prefix).is_file():
-                return prefix
-        else:
-            matches = [p.name for p in self.commits.iterdir()
-                       if p.name.startswith(prefix)]
-            if len(matches) == 1:
-                return matches[0]
-        # An ambiguous prefix is not a unique ID. Never pick a random commit.
-        raise GitletError("No commit with that id exists.")
+        return self.objects.resolve_commit_id(prefix)
 
     def read_index(self) -> tuple[dict[str, str], set[str]]:
-        index = json.loads(self.index_file.read_bytes())
-        return index["add"], set(index["remove"])
+        index = self.index.read()
+        return index.additions, index.removals
 
     def write_index(self, additions: dict[str, str], removals: set[str]) -> None:
-        self.index_file.write_bytes(json_bytes({"add": additions,
-                                                "remove": sorted(removals)}))
+        self.index.write(Index(additions, removals))
 
     def save_blob(self, content: bytes) -> str:
-        blob_id = sha1(content)
-        path = self.blobs / blob_id
-        if not path.exists():
-            path.write_bytes(content)
-        return blob_id
+        return self.objects.write(Blob(content))
 
     def blob_content(self, blob_id: str | None) -> bytes:
-        return b"" if blob_id is None else (self.blobs / blob_id).read_bytes()
+        return b"" if blob_id is None else self.objects.read_blob(blob_id).content
+
+    def working_path(self, name: str) -> Path:
+        """Never traverse a symlink when accessing working files."""
+        name = validate_repo_path(name)
+        path = self.cwd
+        for part in name.split("/"):
+            path = path / part
+            if path.is_symlink():
+                raise GitletError(UNTRACKED)
+        return path
+
+    def write_working_file(self, name: str, content: bytes) -> None:
+        path = self.working_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
 
     def add(self, name: str) -> None:
         name = file_name(name)
-        path = self.cwd / name
+        path = self.working_path(name)
         if not path.is_file() or path.is_symlink():
             raise GitletError("File does not exist.")
         content = path.read_bytes()
-        blob_id = sha1(content)
+        blob_id = object_id(Blob(content))
         additions, removals = self.read_index()
         removals.discard(name)
-        if self.read_commit(self.head_id).files.get(name) == blob_id:
+        if lookup_blob(self.objects, self.read_commit(self.head_id).tree, name) == blob_id:
             additions.pop(name, None)
         else:
             additions[name] = self.save_blob(content)
@@ -140,12 +142,12 @@ class Repository:
         if not additions and not removals:
             raise GitletError("No changes added to the commit.")
         parent_id = self.head_id
-        files = self.read_commit(parent_id).files.copy()
-        for name in removals:
-            files.pop(name, None)
-        files.update(additions)
+        if second_parent is not None:
+            self.objects.read_commit(second_parent)
+        root = apply_changes(self.objects, self.read_commit(parent_id).tree,
+                             additions, removals)
         parents = (parent_id,) if second_parent is None else (parent_id, second_parent)
-        commit = Commit(message, time.time_ns(), parents, files)
+        commit = Commit(message, time.time_ns(), parents, root)
         self.save_commit(commit)
         self.write_branch(self.branch_name, commit.id)
         self.write_index({}, set())
@@ -153,7 +155,7 @@ class Repository:
     def rm(self, name: str) -> None:
         name = file_name(name)
         additions, removals = self.read_index()
-        tracked = name in self.read_commit(self.head_id).files
+        tracked = lookup_blob(self.objects, self.read_commit(self.head_id).tree, name) is not None
         if name not in additions and not tracked:
             raise GitletError("No reason to remove the file.")
         additions.pop(name, None)
@@ -163,9 +165,15 @@ class Repository:
         self.write_index(additions, removals)
 
     def delete_working_file(self, name: str) -> None:
-        path = self.cwd / name
-        if path.is_file() or path.is_symlink():
+        path = self.working_path(name)
+        if path.is_file():
             path.unlink()
+            parent = path.parent
+            while parent != self.cwd:
+                if any(parent.iterdir()):
+                    break
+                parent.rmdir()
+                parent = parent.parent
 
     def log(self) -> None:
         commit_id = self.head_id
@@ -175,21 +183,28 @@ class Repository:
             commit_id = commit.parents[0] if commit.parents else ""
 
     def global_log(self) -> None:
-        for path in self.commits.iterdir():
-            print(self.read_commit(path.name).log_entry(), end="")
+        for obj_id in self.objects.iter_commit_ids():
+            print(self.read_commit(obj_id).log_entry(), end="")
 
     def find(self, message: str) -> None:
-        matches = [path.name for path in self.commits.iterdir()
-                   if self.read_commit(path.name).message == message]
+        matches = [obj_id for obj_id in self.objects.iter_commit_ids()
+                   if self.read_commit(obj_id).message == message]
         if not matches:
             raise GitletError("Found no commit with that message.")
         print("\n".join(matches))
 
     def status(self) -> None:
         additions, removals = self.read_index()
-        files = self.read_commit(self.head_id).files
-        working = {p.name: p for p in self.cwd.iterdir()
-                   if p.is_file() and not p.is_symlink()}
+        files = self.snapshot()
+        working = {}
+        for directory, dirs, names in os.walk(self.cwd, followlinks=False):
+            base = Path(directory)
+            dirs[:] = [d for d in dirs if not (base / d).is_symlink()
+                       and not (base == self.cwd and d == ".gitlet")]
+            for name in names:
+                path = base / name
+                if path.is_file() and not path.is_symlink():
+                    working[path.relative_to(self.cwd).as_posix()] = path
         modifications = {}
         for name in files.keys() | additions.keys():
             if name in removals:
@@ -197,12 +212,11 @@ class Repository:
             expected = additions.get(name, files.get(name))
             if name not in working:
                 modifications[name] = "deleted"
-            elif sha1(working[name].read_bytes()) != expected:
+            elif object_id(Blob(working[name].read_bytes())) != expected:
                 modifications[name] = "modified"
         untracked = {name for name in working if
                      (name not in files and name not in additions) or name in removals}
-        branches = sorted((unquote(p.name[4:]) for p in self.branches.iterdir()),
-                          key=name_order)
+        branches = sorted(self.refs.list_branches(), key=name_order)
         sections = [
             ("Branches", [("*" if b == self.branch_name else "") + b for b in branches]),
             ("Staged Files", sorted(additions, key=name_order)),
@@ -220,30 +234,53 @@ class Repository:
     def checkout_file(self, name: str, prefix: str | None = None) -> None:
         name = file_name(name)
         commit_id = self.head_id if prefix is None else self.resolve_id(prefix)
-        commit = self.read_commit(commit_id)
-        if name not in commit.files:
+        blob_id = lookup_blob(self.objects, self.read_commit(commit_id).tree, name)
+        if blob_id is None:
             raise GitletError("File does not exist in that commit.")
-        path = self.cwd / name
-        if path.is_symlink() or path.is_dir():
+        path = self.working_path(name)
+        if path.is_dir() or any(p.is_file() for p in path.parents if p != self.cwd):
             raise GitletError(UNTRACKED)
-        path.write_bytes(self.blob_content(commit.files[name]))
+        self.write_working_file(name, self.blob_content(blob_id))
 
-    def check_overwrites(self, names: set[str], tracked: dict[str, str]) -> None:
+    def check_overwrites(self, names: set[str], tracked: dict[str, str],
+                         deletes: set[str] | None = None) -> None:
+        deletes = set() if deletes is None else deletes
         for name in names:
-            path = self.cwd / name
-            if (path.is_symlink() or path.is_dir()
-                    or (path.exists() and name not in tracked)):
+            path = self.working_path(name)
+            for parent in path.parents:
+                if parent == self.cwd:
+                    break
+                relative = parent.relative_to(self.cwd).as_posix()
+                if parent.is_file() and relative not in deletes:
+                    raise GitletError(UNTRACKED)
+            if path.is_dir():
+                # Replacing a directory is safe only when every leaf is tracked
+                # and planned for deletion; preserve empty/untracked directories.
+                for base, dirs, files in os.walk(path, followlinks=False):
+                    base = Path(base)
+                    if not dirs and not files:
+                        raise GitletError(UNTRACKED)
+                    for entry in dirs + files:
+                        child = base / entry
+                        rel = child.relative_to(self.cwd).as_posix()
+                        if child.is_symlink() or (child.is_file() and rel not in deletes):
+                            raise GitletError(UNTRACKED)
+            elif path.exists() and name not in tracked:
                 raise GitletError(UNTRACKED)
 
     def restore_tree(self, target_id: str) -> None:
-        current = self.read_commit(self.head_id).files
-        target = self.read_commit(target_id).files
-        self.check_overwrites(set(target), current)
-        for name in current.keys() - target.keys():
+        current = self.snapshot()
+        target = self.snapshot(target_id)
+        deletes = current.keys() - target.keys()
+        self.check_overwrites(set(target), current, deletes)
+        for name in deletes:
+            self.working_path(name)  # Validate deletions before changing any file.
+        contents = {name: self.blob_content(obj_id) for name, obj_id in target.items()}
+        for name in sorted(deletes, key=lambda n: n.count("/"), reverse=True):
             self.delete_working_file(name)
-        for name, blob_id in target.items():
-            (self.cwd / name).write_bytes(self.blob_content(blob_id))
-        self.write_index({}, set())
+        for name, content in contents.items():
+            self.write_working_file(name, content)
+        self.index.clear()
 
     def checkout_branch(self, name: str) -> None:
         if not self.branch_path(name).is_file():
@@ -251,7 +288,7 @@ class Repository:
         if name == self.branch_name:
             raise GitletError("No need to checkout the current branch.")
         self.restore_tree(self.read_branch(name))
-        self.head_file.write_text(name, encoding="utf-8")
+        self.refs.set_head(name)
 
     def branch(self, name: str) -> None:
         if self.branch_path(name).exists():
@@ -264,7 +301,7 @@ class Repository:
             raise GitletError("A branch with that name does not exist.")
         if name == self.branch_name:
             raise GitletError("Cannot remove the current branch.")
-        path.unlink()
+        self.refs.delete_branch(name)
 
     def reset(self, prefix: str) -> None:
         target_id = self.resolve_id(prefix)
@@ -325,9 +362,9 @@ class Repository:
             self.checkout_branch(name)
             print("Current branch fast-forwarded.")
             return
-        current = self.read_commit(current_id).files
-        given = self.read_commit(given_id).files
-        base = self.read_commit(split_id).files
+        current = self.snapshot(current_id)
+        given = self.snapshot(given_id)
+        base = self.snapshot(split_id)
         writes, deletes = {}, set()
         conflict = False
         for filename in sorted(base.keys() | current.keys() | given.keys(), key=name_order):
@@ -344,14 +381,19 @@ class Repository:
                                     + b"=======\n" + self.blob_content(g) + b">>>>>>>\n")
                 conflict = True
         # Validate every affected file before writing any file or metadata.
-        self.check_overwrites(set(writes) | deletes, current)
+        planned = {name: obj_id for name, obj_id in current.items() if name not in deletes}
+        planned.update({name: "" for name in writes})
+        validate_snapshot(planned)
+        self.check_overwrites(set(writes), current, deletes)
+        for filename in deletes:
+            self.working_path(filename)
         if not writes and not deletes:
             raise GitletError("No changes added to the commit.")
-        for filename, content in writes.items():
-            (self.cwd / filename).write_bytes(content)
-            additions[filename] = self.save_blob(content)
-        for filename in deletes:
+        for filename in sorted(deletes, key=lambda n: n.count("/"), reverse=True):
             self.delete_working_file(filename)
+        for filename, content in writes.items():
+            self.write_working_file(filename, content)
+            additions[filename] = self.save_blob(content)
         self.write_index(additions, deletes)
         self.commit(f"Merged {name} into {self.branch_name}.", given_id)
         if conflict:

@@ -6,7 +6,9 @@
 
 需要 **Python 3.10 或更新版本**。运行和测试只使用标准库。
 已实现全部 13 个本地命令，以及 `status` 的两个选做栏目；远程命令未实现。
-Gitlet 只管理仓库根目录的普通文件，不递归管理子目录。
+Gitlet 支持仓库根目录及子目录的普通文件，例如 `gitlet add src/main.py`；一次暂存一个文件。
+当前使用 v2 对象格式：commit、tree、blob 统一存放于 `.gitlet/objects/`。
+旧版仓库不能直接读取；本次重构没有提供自动迁移。
 
 ## 快速运行
 
@@ -125,9 +127,12 @@ python3 -m venv .venv
 - [中文 Python 项目说明](docs/PROJECT.zh-CN.md)：运行方式、数据概念、各命令规则、合并示例、测试与选做范围。
 - [设计说明](docs/DESIGN.zh-CN.md)：类、磁盘格式、SHA-1、合并算法和复杂度。
 - `gitlet/cli.py`：参数检查和命令分发。
-- `gitlet/models.py`：提交对象、稳定 JSON 编码和日志格式。
-- `gitlet/repository.py`：持久化与全部本地命令。
-- `tests/test_gitlet.py`：独立临时目录中的命令行集成测试与提交图测试。
+- `gitlet/models.py`：blob、tree、commit 模型、稳定编码和日志格式。
+- `gitlet/objects.py`：统一对象库、压缩、哈希校验与提交 ID 查找。
+- `gitlet/trees.py`：目录快照查询与更新，复用未变化的子 tree。
+- `gitlet/refs.py` / `gitlet/index.py`：分支引用、HEAD 与暂存区。
+- `gitlet/repository.py`：组织全部本地命令与工作目录操作。
+- `tests/test_gitlet.py` / `tests/test_v2.py`：命令行集成、提交图、对象格式、目录复用和覆盖保护测试。
 
 中文文档是为本 Python 实现独立编写的适配说明，不是原网页的全文逐段译本。
 原课程的 Java 自动评分器不能直接运行此 Python 入口；本项目使用自己的行为测试。
