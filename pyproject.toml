@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygitlet-lab"
+version = "0.1.0"
+description = "A standard-library Python implementation of CS61B Gitlet"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+bundle = ["pyinstaller>=6,<7"]
+
+[project.scripts]
+gitlet = "gitlet.cli:main"
+
+[tool.setuptools]
+packages = ["gitlet"]
