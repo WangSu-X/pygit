@@ -125,8 +125,11 @@ gitlet/
 ## 测试
 
 ```bash
+# 安装项目和测试依赖（建议在虚拟环境中执行）
+python -m pip install -e '.[test]'
+
 # 运行所有测试
-pytest tests/ -v
+python -m pytest tests/ -v
 
 # 或使用 Makefile
 make test         # 详细输出
@@ -141,6 +144,11 @@ make test-quick   # 简洁输出
 - `test_security.py` - 安全性和边界测试
 
 所有 84 个测试必须通过。
+
+GitHub Actions 配置位于 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+每次 push、pull request 或手动触发时，会在 Ubuntu 上测试 Python
+3.10–3.14，并在 macOS 上测试 Python 3.14。同一分支的新运行会取消旧运行。
+提交并推送配置后，可在仓库的 Actions 页面查看结果。
 
 ## 参考
 
